@@ -498,7 +498,19 @@ make_pidfile(void)
 }
 
 void
+daemonize_start__(bool access_datapath OVS_UNUSED)
+{
+}
+
+void
 daemonize_start(bool access_datapath OVS_UNUSED)
+{
+    daemonize_start__(access_datapath);
+    daemonize_make_pidfile();
+}
+
+void
+daemonize_make_pidfile(void)
 {
     if (pidfile) {
         make_pidfile();

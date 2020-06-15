@@ -269,6 +269,7 @@ struct xlate_ctx {
     bool exit;                  /* No further actions should be processed. */
     mirror_mask_t mirrors;      /* Bitmap of associated mirrors. */
     int mirror_snaplen;         /* Max size of a mirror packet in byte. */
+    bool in_mirror_output;
 
    /* Freezing Translation
     * ====================
@@ -445,6 +446,12 @@ const char *xlate_strerror(enum xlate_error error)
         return "Invalid tunnel metadata";
     case XLATE_UNSUPPORTED_PACKET_TYPE:
         return "Unsupported packet type";
+    case XLATE_CONGESTION_DROP:
+        return "Congestion Drop";
+    case XLATE_FORWARDING_DISABLED:
+        return "Forwarding is disabled";
+    case XLATE_MAX:
+        break;
     }
     return "Unknown error";
 }
@@ -1165,11 +1172,15 @@ xlate_xport_copy(struct xbridge *xbridge, struct xbundle *xbundle,
  *
  * A sample workflow:
  *
- * xlate_txn_start();
- * ...
- * edit_xlate_configuration();
- * ...
- * xlate_txn_commit(); */
+ *     xlate_txn_start();
+ *     ...
+ *     edit_xlate_configuration();
+ *     ...
+ *     xlate_txn_commit();
+ *
+ * The ovsrcu_synchronize() call here also ensures that the upcall threads
+ * retain no references to anything in the previous configuration.
+ */
 void
 xlate_txn_commit(void)
 {
@@ -1510,14 +1521,31 @@ xlate_lookup_ofproto_(const struct dpif_backer *backer,
             return NULL;
         }
 
-        /* If recirculation was initiated due to bond (in_port = OFPP_NONE)
-         * then frozen state is static and xport_uuid is not defined, so xport
-         * cannot be restored from frozen state. */
-        if (recirc_id_node->state.metadata.in_port != OFPP_NONE) {
+        ofp_port_t in_port = recirc_id_node->state.metadata.in_port;
+        if (in_port != OFPP_NONE && in_port != OFPP_CONTROLLER) {
             struct uuid xport_uuid = recirc_id_node->state.xport_uuid;
             xport = xport_lookup_by_uuid(xcfg, &xport_uuid);
             if (xport && xport->xbridge && xport->xbridge->ofproto) {
                 goto out;
+            }
+        } else {
+            /* OFPP_NONE and OFPP_CONTROLLER are not real ports.  They indicate
+             * that the packet originated from the controller via an OpenFlow
+             * "packet-out".  The right thing to do is to find just the
+             * ofproto.  There is no xport, which is OK.
+             *
+             * OFPP_NONE can also indicate that a bond caused recirculation. */
+            struct uuid uuid = recirc_id_node->state.ofproto_uuid;
+            const struct xbridge *bridge = xbridge_lookup_by_uuid(xcfg, &uuid);
+            if (bridge && bridge->ofproto) {
+                if (errorp) {
+                    *errorp = NULL;
+                }
+                *xportp = NULL;
+                if (ofp_in_port) {
+                    *ofp_in_port = in_port;
+                }
+                return bridge->ofproto;
             }
         }
     }
@@ -1878,9 +1906,12 @@ bucket_is_alive(const struct xlate_ctx *ctx,
 
     return (!ofputil_bucket_has_liveness(bucket)
             || (bucket->watch_port != OFPP_ANY
+               && bucket->watch_port != OFPP_CONTROLLER
                && odp_port_is_alive(ctx, bucket->watch_port))
             || (bucket->watch_group != OFPG_ANY
-               && group_is_alive(ctx, bucket->watch_group, depth + 1)));
+               && group_is_alive(ctx, bucket->watch_group, depth + 1))
+            || (bucket->watch_port == OFPP_CONTROLLER
+               && ofproto_is_alive(&ctx->xbridge->ofproto->up)));
 }
 
 static void
@@ -2124,7 +2155,9 @@ mirror_packet(struct xlate_ctx *ctx, struct xbundle *xbundle,
         if (out) {
             struct xbundle *out_xbundle = xbundle_lookup(ctx->xcfg, out);
             if (out_xbundle) {
+                ctx->in_mirror_output = true;
                 output_normal(ctx, out_xbundle, &xvlan);
+                ctx->in_mirror_output = false;
             }
         } else if (xvlan.v[0].vid != out_vlan
                    && !eth_addr_is_reserved(ctx->xin->flow.dl_dst)) {
@@ -2135,7 +2168,9 @@ mirror_packet(struct xlate_ctx *ctx, struct xbundle *xbundle,
             LIST_FOR_EACH (xb, list_node, &xbridge->xbundles) {
                 if (xbundle_includes_vlan(xb, &xvlan)
                     && !xbundle_mirror_out(xbridge, xb)) {
+                    ctx->in_mirror_output = true;
                     output_normal(ctx, xb, &xvlan);
+                    ctx->in_mirror_output = false;
                 }
             }
             xvlan.v[0].vid = old_vid;
@@ -4050,7 +4085,17 @@ terminate_native_tunnel(struct xlate_ctx *ctx, struct flow *flow,
     /* XXX: Write better Filter for tunnel port. We can use in_port
      * in tunnel-port flow to avoid these checks completely. */
     if (ovs_native_tunneling_is_on(ctx->xbridge->ofproto)) {
-        *tnl_port = tnl_port_map_lookup(flow, wc);
+        /* to check if the wc contains src info, if not, erase all
+         * source info including smac, and sip
+         */
+        if (!WC_FIELD_MASKED(wc, nw_src)) {
+            *tnl_port = tnl_port_map_lookup(flow, wc);
+            if (*tnl_port != ODPP_NONE && !WC_FIELD_MASKED(wc, nw_src)) {
+                memset(&wc->masks.dl_src, 0, sizeof wc->masks.dl_src);
+            }
+        } else {
+            *tnl_port = tnl_port_map_lookup(flow, wc);
+        }
 
         /* If no tunnel port was found and it's about an ARP or ICMPv6 packet,
          * do tunnel neighbor snooping. */
@@ -4193,7 +4238,7 @@ compose_output_action__(struct xlate_ctx *ctx, ofp_port_t ofp_port,
             native_tunnel_output(ctx, xport, flow, odp_port, truncate);
             flow->tunnel = flow_tnl; /* Restore tunnel metadata */
 
-        } else if (terminate_native_tunnel(ctx, flow, wc,
+        } else if (!ctx->in_mirror_output && terminate_native_tunnel(ctx, flow, wc,
                                            &odp_tnl_port)) {
             /* Intercept packet to be received on native tunnel port. */
             nl_msg_put_odp_port(ctx->odp_actions, OVS_ACTION_ATTR_TUNNEL_POP,
@@ -6002,6 +6047,12 @@ put_ct_label(const struct flow *flow, struct ofpbuf *odp_actions,
 }
 
 static void
+put_drop_action(struct ofpbuf *odp_actions, enum xlate_error error)
+{
+    nl_msg_put_u32(odp_actions, OVS_ACTION_ATTR_DROP, error);
+}
+
+static void
 put_ct_helper(struct xlate_ctx *ctx,
               struct ofpbuf *odp_actions, struct ofpact_conntrack *ofc)
 {
@@ -7425,6 +7476,7 @@ xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
         .exit = false,
         .error = XLATE_OK,
         .mirrors = 0,
+        .in_mirror_output = false,
 
         .freezing = false,
         .recirc_update_dp_hash = false,
@@ -7499,7 +7551,8 @@ xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
 
         /* Restore pipeline metadata. May change flow's in_port and other
          * metadata to the values that existed when freezing was triggered. */
-        frozen_metadata_to_flow(&state->metadata, flow);
+        frozen_metadata_to_flow(&ctx.xbridge->ofproto->up,
+                                &state->metadata, flow);
 
         /* Restore stack, if any. */
         if (state->stack) {
@@ -7551,14 +7604,10 @@ xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
             ctx.error = XLATE_INVALID_TUNNEL_METADATA;
             goto exit;
         }
-    } else if (!flow->tunnel.metadata.tab || xin->frozen_state) {
+    } else if (!flow->tunnel.metadata.tab) {
         /* If the original flow did not come in on a tunnel, then it won't have
          * FLOW_TNL_F_UDPIF set. However, we still need to have a metadata
          * table in case we generate tunnel actions. */
-        /* If the translation is from a frozen state, we use the latest
-         * TLV map to avoid segmentation fault in case the old TLV map is
-         * replaced by a new one.
-         * XXX: It is better to abort translation if the table is changed. */
         flow->tunnel.metadata.tab = ofproto_get_tun_tab(
             &ctx.xbridge->ofproto->up);
     }
@@ -7570,6 +7619,10 @@ xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
                                          ctx.base_flow.in_port.ofp_port);
     if (in_port && !in_port->peer) {
         ctx.xin->xport_uuid = in_port->uuid;
+    }
+
+    if (in_port && in_port->is_tunnel) {
+        tnl_wc_init_by_port(in_port->ofport, ctx.wc);
     }
 
     if (flow->packet_type != htonl(PT_ETH) && in_port &&
@@ -7638,8 +7691,9 @@ xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
             compose_ipfix_action(&ctx, ODPP_NONE);
         }
         size_t sample_actions_len = ctx.odp_actions->size;
+        bool ecn_drop = !tnl_process_ecn(flow);
 
-        if (tnl_process_ecn(flow)
+        if (!ecn_drop
             && (!in_port || may_receive(in_port, &ctx))) {
             const struct ofpact *ofpacts;
             size_t ofpacts_len;
@@ -7671,6 +7725,7 @@ xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
                 ctx.odp_actions->size = sample_actions_len;
                 ctx_cancel_freeze(&ctx);
                 ofpbuf_clear(&ctx.action_set);
+                ctx.error = XLATE_FORWARDING_DISABLED;
             }
 
             if (!ctx.freezing) {
@@ -7679,6 +7734,8 @@ xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
             if (ctx.freezing) {
                 finish_freezing(&ctx);
             }
+        } else if (ecn_drop) {
+            ctx.error = XLATE_CONGESTION_DROP;
         }
 
         /* Output only fully processed packets. */
@@ -7784,6 +7841,21 @@ exit:
             ofpbuf_clear(xin->odp_actions);
         }
     }
+
+    /* Install drop action if datapath supports explicit drop action. */
+    if (xin->odp_actions && !xin->odp_actions->size &&
+        ovs_explicit_drop_action_supported(ctx.xbridge->ofproto)) {
+        put_drop_action(xin->odp_actions, ctx.error);
+    }
+
+    /* Since congestion drop and forwarding drop are not exactly
+     * translation error, we are resetting the translation error.
+     */
+    if (ctx.error == XLATE_CONGESTION_DROP ||
+        ctx.error == XLATE_FORWARDING_DISABLED) {
+        ctx.error = XLATE_OK;
+    }
+
     return ctx.error;
 }
 

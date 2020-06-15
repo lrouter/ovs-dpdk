@@ -649,6 +649,12 @@ ofproto_set_controllers(struct ofproto *p, struct shash *controllers)
 }
 
 void
+ofproto_remove_controllers(struct ofproto *p, struct shash *controllers)
+{
+    connmgr_remove_controllers(p->connmgr, controllers);
+}
+
+void
 ofproto_set_fail_mode(struct ofproto *p, enum ofproto_fail_mode fail_mode)
 {
     connmgr_set_fail_mode(p->connmgr, fail_mode);
@@ -952,6 +958,18 @@ bool
 ofproto_get_flow_restore_wait(void)
 {
     return flow_restore_wait;
+}
+
+/* Retrieve datapath capabilities. */
+void
+ofproto_get_datapath_cap(const char *datapath_type, struct smap *dp_cap)
+{
+    datapath_type = ofproto_normalize_type(datapath_type);
+    const struct ofproto_class *class = ofproto_class_find__(datapath_type);
+
+    if (class->get_datapath_cap) {
+        class->get_datapath_cap(datapath_type, dp_cap);
+    }
 }
 
 /* Connection tracking configuration. */
@@ -1589,13 +1607,13 @@ ofproto_rule_delete(struct ofproto *ofproto, struct rule *rule)
 }
 
 static void
-ofproto_flush__(struct ofproto *ofproto)
+ofproto_flush__(struct ofproto *ofproto, bool del)
     OVS_EXCLUDED(ofproto_mutex)
 {
     struct oftable *table;
 
     /* This will flush all datapath flows. */
-    if (ofproto->ofproto_class->flush) {
+    if (del && ofproto->ofproto_class->flush) {
         ofproto->ofproto_class->flush(ofproto);
     }
 
@@ -1677,14 +1695,28 @@ ofproto_destroy__(struct ofproto *ofproto)
     ofproto->ofproto_class->dealloc(ofproto);
 }
 
+static void
+ofproto_destroy_defer__3(struct ofproto *ofproto)
+    OVS_EXCLUDED(ofproto_mutex)
+{
+    ovsrcu_postpone(ofproto_destroy__, ofproto);
+}
+
+static void
+ofproto_destroy_defer__2(struct ofproto *ofproto)
+    OVS_EXCLUDED(ofproto_mutex)
+{
+    ovsrcu_postpone(ofproto_destroy_defer__3, ofproto);
+}
+
 /* Destroying rules is doubly deferred, must have 'ofproto' around for them.
  * - 1st we defer the removal of the rules from the classifier
  * - 2nd we defer the actual destruction of the rules. */
 static void
-ofproto_destroy_defer__(struct ofproto *ofproto)
+ofproto_destroy_defer__1(struct ofproto *ofproto)
     OVS_EXCLUDED(ofproto_mutex)
 {
-    ovsrcu_postpone(ofproto_destroy__, ofproto);
+    ovsrcu_postpone(ofproto_destroy_defer__2, ofproto);
 }
 
 void
@@ -1698,7 +1730,7 @@ ofproto_destroy(struct ofproto *p, bool del)
         return;
     }
 
-    ofproto_flush__(p);
+    ofproto_flush__(p, del);
     HMAP_FOR_EACH_SAFE (ofport, next_ofport, hmap_node, &p->ports) {
         ofport_destroy(ofport, del);
     }
@@ -1719,7 +1751,7 @@ ofproto_destroy(struct ofproto *p, bool del)
     ovs_mutex_unlock(&ofproto_mutex);
 
     /* Destroying rules is deferred, must have 'ofproto' around for them. */
-    ovsrcu_postpone(ofproto_destroy_defer__, p);
+    ovsrcu_postpone(ofproto_destroy_defer__1, p);
 }
 
 /* Destroys the datapath with the respective 'name' and 'type'.  With the Linux
@@ -1887,7 +1919,8 @@ ofproto_wait(struct ofproto *p)
 bool
 ofproto_is_alive(const struct ofproto *p)
 {
-    return connmgr_has_controllers(p->connmgr);
+    return (connmgr_has_controllers(p->connmgr)
+            && connmgr_is_any_controller_admitted(p->connmgr));
 }
 
 /* Adds some memory usage statistics for 'ofproto' into 'usage', for use with
@@ -2276,7 +2309,7 @@ void
 ofproto_flush_flows(struct ofproto *ofproto)
 {
     COVERAGE_INC(ofproto_flush);
-    ofproto_flush__(ofproto);
+    ofproto_flush__(ofproto, false);
     connmgr_flushed(ofproto->connmgr);
 }
 
@@ -3635,9 +3668,20 @@ ofproto_packet_out_revert(struct ofproto *ofproto,
 }
 
 static void
+ofproto_packet_out_prepare(struct ofproto *ofproto,
+                           struct ofproto_packet_out *opo)
+    OVS_REQUIRES(ofproto_mutex)
+{
+    ofproto->ofproto_class->packet_execute_prepare(ofproto, opo);
+}
+
+/* Execution of packet_out action in datapath could end up in upcall with
+ * subsequent flow translations and possible rule modifications.
+ * So, the caller should not hold 'ofproto_mutex'. */
+static void
 ofproto_packet_out_finish(struct ofproto *ofproto,
                           struct ofproto_packet_out *opo)
-    OVS_REQUIRES(ofproto_mutex)
+    OVS_EXCLUDED(ofproto_mutex)
 {
     ofproto->ofproto_class->packet_execute(ofproto, opo);
 }
@@ -3680,10 +3724,13 @@ handle_packet_out(struct ofconn *ofconn, const struct ofp_header *oh)
     opo.version = p->tables_version;
     error = ofproto_packet_out_start(p, &opo);
     if (!error) {
-        ofproto_packet_out_finish(p, &opo);
+        ofproto_packet_out_prepare(p, &opo);
     }
     ovs_mutex_unlock(&ofproto_mutex);
 
+    if (!error) {
+        ofproto_packet_out_finish(p, &opo);
+    }
     ofproto_packet_out_uninit(&opo);
     return error;
 }
@@ -8202,7 +8249,7 @@ do_bundle_commit(struct ofconn *ofconn, uint32_t id, uint16_t flags)
                     } else if (be->type == OFPTYPE_GROUP_MOD) {
                         ofproto_group_mod_finish(ofproto, &be->ogm, &req);
                     } else if (be->type == OFPTYPE_PACKET_OUT) {
-                        ofproto_packet_out_finish(ofproto, &be->opo);
+                        ofproto_packet_out_prepare(ofproto, &be->opo);
                     }
                 }
                 if (error) {
@@ -8213,7 +8260,7 @@ do_bundle_commit(struct ofconn *ofconn, uint32_t id, uint16_t flags)
                 /* Send error referring to the original message. */
                 ofconn_send_error(ofconn, be->msg, error);
                 error = OFPERR_OFPBFC_MSG_FAILED;
-                
+
                 /* Revert.  Undo all the changes made above. */
                 LIST_FOR_EACH_REVERSE_CONTINUE (be, node, &bundle->msg_list) {
                     if (be->type == OFPTYPE_FLOW_MOD) {
@@ -8230,6 +8277,13 @@ do_bundle_commit(struct ofconn *ofconn, uint32_t id, uint16_t flags)
 
         ofmonitor_flush(ofproto->connmgr);
         ovs_mutex_unlock(&ofproto_mutex);
+    }
+
+    /* Executing remaining datapath actions. */
+    LIST_FOR_EACH (be, node, &bundle->msg_list) {
+        if (be->type == OFPTYPE_PACKET_OUT) {
+            ofproto_packet_out_finish(ofproto, &be->opo);
+        }
     }
 
     /* The bundle is discarded regardless the outcome. */

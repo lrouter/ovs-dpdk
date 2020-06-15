@@ -56,6 +56,7 @@
 #include "openvswitch/vlog.h"
 #include "flow.h"
 #include "util.h"
+#include "cmap.h"
 #ifdef __linux__
 #include "tc.h"
 #endif
@@ -66,6 +67,8 @@ COVERAGE_DEFINE(netdev_received);
 COVERAGE_DEFINE(netdev_sent);
 COVERAGE_DEFINE(netdev_add_router);
 COVERAGE_DEFINE(netdev_get_stats);
+COVERAGE_DEFINE(netdev_send_prepare_drops);
+COVERAGE_DEFINE(netdev_push_header_drops);
 
 struct netdev_saved_flags {
     struct netdev *netdev;
@@ -149,7 +152,6 @@ netdev_initialize(void)
         netdev_register_provider(&netdev_tap_class);
         netdev_vport_tunnel_register();
 
-        netdev_register_flow_api_provider(&netdev_offload_tc);
 #ifdef HAVE_AF_XDP
         netdev_register_provider(&netdev_afxdp_class);
 #endif
@@ -423,6 +425,8 @@ netdev_open(const char *name, const char *type, struct netdev **netdevp)
                     seq_read(netdev->reconfigure_seq);
                 ovsrcu_set(&netdev->flow_api, NULL);
                 netdev->hw_info.oor = false;
+                cmap_init(&netdev->hw_info.hw_flows);
+                smap_init(&netdev->args);
                 netdev->node = shash_add(&netdev_shash, name, netdev);
 
                 /* By default enable one tx and rx queue per netdev. */
@@ -581,6 +585,8 @@ netdev_unref(struct netdev *dev)
         }
         free(dev->name);
         seq_destroy(dev->reconfigure_seq);
+        smap_destroy(&dev->args);
+        cmap_destroy(&dev->hw_info.hw_flows);
         dev->netdev_class->dealloc(dev);
         ovs_mutex_unlock(&netdev_mutex);
 
@@ -782,6 +788,76 @@ netdev_get_pt_mode(const struct netdev *netdev)
             : NETDEV_PT_LEGACY_L2);
 }
 
+/* Check if a 'packet' is compatible with 'netdev_flags'.
+ * If a packet is incompatible, return 'false' with the 'errormsg'
+ * pointing to a reason. */
+static bool
+netdev_send_prepare_packet(const uint64_t netdev_flags,
+                           struct dp_packet *packet, char **errormsg)
+{
+    uint64_t l4_mask;
+
+    if (dp_packet_hwol_is_tso(packet)
+        && !(netdev_flags & NETDEV_TX_OFFLOAD_TCP_TSO)) {
+            /* Fall back to GSO in software. */
+            VLOG_ERR_BUF(errormsg, "No TSO support");
+            return false;
+    }
+
+    l4_mask = dp_packet_hwol_l4_mask(packet);
+    if (l4_mask) {
+        if (dp_packet_hwol_l4_is_tcp(packet)) {
+            if (!(netdev_flags & NETDEV_TX_OFFLOAD_TCP_CKSUM)) {
+                /* Fall back to TCP csum in software. */
+                VLOG_ERR_BUF(errormsg, "No TCP checksum support");
+                return false;
+            }
+        } else if (dp_packet_hwol_l4_is_udp(packet)) {
+            if (!(netdev_flags & NETDEV_TX_OFFLOAD_UDP_CKSUM)) {
+                /* Fall back to UDP csum in software. */
+                VLOG_ERR_BUF(errormsg, "No UDP checksum support");
+                return false;
+            }
+        } else if (dp_packet_hwol_l4_is_sctp(packet)) {
+            if (!(netdev_flags & NETDEV_TX_OFFLOAD_SCTP_CKSUM)) {
+                /* Fall back to SCTP csum in software. */
+                VLOG_ERR_BUF(errormsg, "No SCTP checksum support");
+                return false;
+            }
+        } else {
+            VLOG_ERR_BUF(errormsg, "No L4 checksum support: mask: %"PRIu64,
+                         l4_mask);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/* Check if each packet in 'batch' is compatible with 'netdev' features,
+ * otherwise either fall back to software implementation or drop it. */
+static void
+netdev_send_prepare_batch(const struct netdev *netdev,
+                          struct dp_packet_batch *batch)
+{
+    struct dp_packet *packet;
+    size_t i, size = dp_packet_batch_size(batch);
+
+    DP_PACKET_BATCH_REFILL_FOR_EACH (i, size, packet, batch) {
+        char *errormsg = NULL;
+
+        if (netdev_send_prepare_packet(netdev->ol_flags, packet, &errormsg)) {
+            dp_packet_batch_refill(batch, packet, i);
+        } else {
+            dp_packet_delete(packet);
+            COVERAGE_INC(netdev_send_prepare_drops);
+            VLOG_WARN_RL(&rl, "%s: Packet dropped: %s",
+                         netdev_get_name(netdev), errormsg);
+            free(errormsg);
+        }
+    }
+}
+
 /* Sends 'batch' on 'netdev'.  Returns 0 if successful (for every packet),
  * otherwise a positive errno value.  Returns EAGAIN without blocking if
  * at least one the packets cannot be queued immediately.  Returns EMSGSIZE
@@ -811,8 +887,14 @@ int
 netdev_send(struct netdev *netdev, int qid, struct dp_packet_batch *batch,
             bool concurrent_txq)
 {
-    int error = netdev->netdev_class->send(netdev, qid, batch,
-                                           concurrent_txq);
+    int error;
+
+    netdev_send_prepare_batch(netdev, batch);
+    if (OVS_UNLIKELY(dp_packet_batch_is_empty(batch))) {
+        return 0;
+    }
+
+    error = netdev->netdev_class->send(netdev, qid, batch, concurrent_txq);
     if (!error) {
         COVERAGE_INC(netdev_sent);
     }
@@ -878,9 +960,27 @@ netdev_push_header(const struct netdev *netdev,
                    const struct ovs_action_push_tnl *data)
 {
     struct dp_packet *packet;
-    DP_PACKET_BATCH_FOR_EACH (i, packet, batch) {
+    size_t i, size = dp_packet_batch_size(batch);
+
+    DP_PACKET_BATCH_REFILL_FOR_EACH (i, size, packet, batch) {
+#ifndef DPDK_NETDEV
+        if (OVS_UNLIKELY(dp_packet_hwol_is_tso(packet)
+                         || dp_packet_hwol_l4_mask(packet))) {
+            COVERAGE_INC(netdev_push_header_drops);
+            dp_packet_delete(packet);
+            VLOG_WARN_RL(&rl, "%s: Tunneling packets with HW offload flags is "
+                         "not supported: packet dropped",
+                         netdev_get_name(netdev));
+        } else {
+            netdev->netdev_class->push_header(netdev, packet, data);
+            pkt_metadata_init(&packet->md, data->out_port);
+            dp_packet_batch_refill(batch, packet, i);
+        }
+#else
         netdev->netdev_class->push_header(netdev, packet, data);
         pkt_metadata_init(&packet->md, data->out_port);
+        dp_packet_batch_refill(batch, packet, i);
+#endif
     }
 
     return 0;
@@ -2039,7 +2139,12 @@ restore_all_flags(void *aux OVS_UNUSED)
 uint64_t
 netdev_get_change_seq(const struct netdev *netdev)
 {
-    return netdev->change_seq;
+    uint64_t change_seq;
+
+    atomic_read_explicit(&CONST_CAST(struct netdev *, netdev)->change_seq,
+                        &change_seq, memory_order_acquire);
+
+    return change_seq;
 }
 
 #ifndef _WIN32
@@ -2184,4 +2289,19 @@ netdev_free_custom_stats_counters(struct netdev_custom_stats *custom_stats)
             custom_stats->size = 0;
         }
     }
+}
+
+void netdev_set_args(struct netdev *netdev, const char *key, const char *value)
+{
+   smap_add(&netdev->args, key, value);
+}
+
+const char* netdev_get_args(struct netdev *netdev, const char *key)
+{
+    return smap_get(&netdev->args, key);
+}
+
+int netdev_get_ref_cnt(struct netdev *netdev)
+{
+    return netdev->ref_cnt;
 }

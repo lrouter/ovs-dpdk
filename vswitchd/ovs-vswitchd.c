@@ -52,6 +52,7 @@
 #include "openvswitch/vlog.h"
 #include "lib/vswitch-idl.h"
 #include "lib/dns-resolve.h"
+#include "ndu.h"
 
 VLOG_DEFINE_THIS_MODULE(vswitchd);
 
@@ -88,7 +89,12 @@ main(int argc, char *argv[])
     remote = parse_options(argc, argv, &unixctl_path);
     fatal_ignore_sigpipe();
 
-    daemonize_start(true);
+    pid_t already_running_pid = get_already_running_pid();
+    daemonize_start__(true);
+    if (already_running_pid > 0) {
+        ndu_connect_and_stage1(already_running_pid);
+    }
+    daemonize_make_pidfile();
 
     if (want_mlockall) {
 #ifdef HAVE_MLOCKALL
@@ -132,6 +138,9 @@ main(int argc, char *argv[])
         bridge_wait();
         unixctl_server_wait(unixctl);
         netdev_wait();
+        if (ndu_state() == NDU_STATE_DONE) {
+            exiting = true;
+        }
         if (exiting) {
             poll_immediate_wake();
         }

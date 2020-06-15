@@ -22,6 +22,7 @@
 #include "openvswitch/types.h"
 #include "packets.h"
 #include "flow.h"
+#include "cmap.h"
 
 #ifdef  __cplusplus
 extern "C" {
@@ -45,6 +46,7 @@ struct netdev_hw_info {
     bool oor;		/* Out of Offload Resources ? */
     int offload_count;  /* Pending (non-offloaded) flow count */
     int pending_count;  /* Offloaded flow count */
+    struct cmap hw_flows;
 };
 
 enum hw_info_type {
@@ -63,15 +65,30 @@ struct netdev_flow_dump {
 /* Flow offloading. */
 struct offload_info {
     const struct dpif_class *dpif_class;
-    ovs_be16 tp_dst_port; /* Destination port for tunnel in SET action */
+
+    /* tunnel outter info */
+    ovs_be32 tun_dst;
+    struct eth_addr tun_dl_dst;
+    ovs_be16 tp_dst_port;
     uint8_t tunnel_csum_on; /* Tunnel header with checksum */
 
+    struct odp_support *odp_support;
     /*
      * The flow mark id assigened to the flow. If any pkts hit the flow,
      * it will be in the pkt meta data.
      */
     uint32_t flow_mark;
-    bool actions_offloaded; /* true if flow is fully actions_offloaded */
+    unsigned version;
+    union {
+        uint32_t action_flags;
+        struct {
+            uint32_t actions_offloaded:1,/* true if flow is fully actions_offloaded */
+                     vxlan_decap:1,
+                     vlan_push:1,
+                     mark_set:1,
+                     drop:1;
+        };
+    };
 };
 
 int netdev_flow_flush(struct netdev *);
@@ -89,8 +106,6 @@ int netdev_flow_get(struct netdev *, struct match *, struct nlattr **actions,
                     struct dpif_flow_attrs *, struct ofpbuf *wbuffer);
 int netdev_flow_del(struct netdev *, const ovs_u128 *,
                     struct dpif_flow_stats *);
-int netdev_flow_stats_get(struct netdev *, const ovs_u128 *,
-                          struct dpif_flow_stats *);
 int netdev_init_flow_api(struct netdev *);
 void netdev_uninit_flow_api(struct netdev *);
 uint32_t netdev_get_block_id(struct netdev *);

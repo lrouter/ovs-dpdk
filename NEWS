@@ -1,18 +1,37 @@
-Post-v2.12.0
+Post-v2.13.0
+---------------------
+   - ovs-vswitchd no longer deletes datapath flows on exit by default.
+   - OpenFlow:
+     * The OpenFlow ofp_desc/serial_num may now be configured by setting the
+       value of other-config:dp-sn in the Bridge table.
+     * Added support to watch CONTROLLER port status in fast failover group.
+   - DPDK:
+     * Deprecated DPDK pdump packet capture support removed.
+     * Deprecated DPDK ring ports (dpdkr) are no longer supported.
+
+
+v2.13.0 - xx xxx xxxx
 ---------------------
    - OVN:
      * OVN has been removed from this repository. It now exists as a
        separate project. You can find it at
        https://github.com/ovn-org/ovn.git
    - Userspace datapath:
+     * Add option to enable, disable and query TCP sequence checking in
+       conntrack.
+     * Add support for conntrack zone limits.
+   - AF_XDP:
      * New option 'use-need-wakeup' for netdev-afxdp to control enabling
        of corresponding 'need_wakeup' flag in AF_XDP rings.  Enabled by default
        if supported by libbpf.
-     * Add option to enable, disable and query TCP sequence checking in
-       conntrack.
+     * 'xdpmode' option for netdev-afxdp renamed to 'xdp-mode'.
+       Modes also updated.  New values:
+         native-with-zerocopy  - former DRV
+         native                - new one, DRV without zero-copy
+         generic               - former SKB
+         best-effort [default] - new one, chooses the best available from
+                                 3 above modes
    - DPDK:
-     * Add hardware offload support for output, drop, set of MAC, IPv4,
-       TCP/UDP ports and tunnel push-output actions.
 
 v2.12.0 - 03 Sep 2019
 ---------------------

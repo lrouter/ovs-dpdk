@@ -168,6 +168,7 @@ bool get_detach(void);
 void daemon_save_fd(int fd);
 void daemonize(void);
 void daemonize_start(bool access_datapath);
+void daemonize_start__(bool access_datapath);
 void daemonize_complete(void);
 void daemon_set_new_user(const char * user_spec);
 void daemon_become_new_user(bool access_datapath);
@@ -179,5 +180,7 @@ void service_stop(void);
 bool should_service_stop(void);
 void set_pidfile(const char *name);
 void close_standard_fds(void);
+void daemonize_make_pidfile(void);
+pid_t get_already_running_pid(void);
 
 #endif /* daemon.h */

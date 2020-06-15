@@ -4882,10 +4882,10 @@ parse_RESUBMIT(char *arg, const struct ofpact_parse_params *pp)
         resubmit->with_ct_orig = false;
     }
 
-    if (resubmit->in_port == OFPP_IN_PORT && resubmit->table_id == 255) {
-        return xstrdup("at least one \"in_port\" or \"table\" must be "
-                       "specified on resubmit");
-    }
+    //if (resubmit->in_port == OFPP_IN_PORT && resubmit->table_id == 255) {
+    //    return xstrdup("at least one \"in_port\" or \"table\" must be "
+    //                   "specified on resubmit");
+    //}
     return NULL;
 }
 
@@ -5966,6 +5966,7 @@ parse_CLONE(char *arg, const struct ofpact_parse_params *pp)
     clone = pp->ofpacts->header;
 
     if (ofpbuf_oversized(pp->ofpacts)) {
+        free(error);
         return xasprintf("input too big");
     }
 
@@ -6657,6 +6658,7 @@ parse_CT(char *arg, const struct ofpact_parse_params *pp)
     }
 
     if (ofpbuf_oversized(pp->ofpacts)) {
+        free(error);
         return xasprintf("input too big");
     }
 

@@ -25,6 +25,7 @@
 #include "cfm.h"
 #include "connectivity.h"
 #include "coverage.h"
+#include "daemon-private.h"
 #include "daemon.h"
 #include "dirs.h"
 #include "dpif.h"
@@ -65,11 +66,14 @@
 #include "system-stats.h"
 #include "timeval.h"
 #include "tnl-ports.h"
+#include "userspace-tso.h"
 #include "util.h"
 #include "unixctl.h"
 #include "lib/vswitch-idl.h"
 #include "xenserver.h"
 #include "vlan-bitmap.h"
+#include "ndu.h"
+#include "openvswitch/util.h"
 
 VLOG_DEFINE_THIS_MODULE(bridge);
 
@@ -171,6 +175,7 @@ struct datapath {
     struct hmap ct_zones;       /* Map of 'struct ct_zone' elements, indexed
                                  * by 'zone'. */
     struct hmap_node node;      /* Node in 'all_datapaths' hmap. */
+    struct smap caps;           /* Capabilities. */
     unsigned int last_used;     /* The last idl_seqno that this 'datapath'
                                  * used in OVSDB. This number is used for
                                  * garbage collection. */
@@ -353,6 +358,10 @@ static bool iface_is_synthetic(const struct iface *);
 static ofp_port_t iface_get_requested_ofp_port(
     const struct ovsrec_interface *);
 static ofp_port_t iface_pick_ofport(const struct ovsrec_interface *);
+static int
+bridge_remove_services_and_snoop(void);
+static int
+bridge_remove_all_bridges(void);
 
 
 static void discover_types(const struct ovsrec_open_vswitch *cfg);
@@ -518,6 +527,18 @@ bridge_init(const char *remote)
                              bridge_unixctl_dump_flows, NULL);
     unixctl_command_register("bridge/reconnect", "[bridge]", 0, 1,
                              bridge_unixctl_reconnect, NULL);
+
+    struct ndu_ctx ndu_ctx = {
+        .remote = (char*)remote,
+        .idl = idl,
+        .br_remove_services_and_snoop = \
+                            bridge_remove_services_and_snoop,
+        .br_remove_all_bridges = \
+                            bridge_remove_all_bridges,
+        .pidfile = pidfile,
+    };
+    ndu_init(&ndu_ctx);
+
     lacp_init();
     bond_init();
     cfm_init();
@@ -529,11 +550,13 @@ bridge_init(const char *remote)
     ifaces_changed = seq_create();
     last_ifaces_changed = seq_read(ifaces_changed);
     ifnotifier = if_notifier_create(if_change_cb, NULL);
+    if_notifier_manual_set_cb(if_change_cb);
 }
 
 void
 bridge_exit(bool delete_datapath)
 {
+    if_notifier_manual_set_cb(NULL);
     if_notifier_destroy(ifnotifier);
     seq_destroy(ifaces_changed);
 
@@ -547,6 +570,7 @@ bridge_exit(bool delete_datapath)
         bridge_destroy(br, delete_datapath);
     }
 
+    ndu_destroy();
     ovsdb_idl_destroy(idl);
 }
 
@@ -700,6 +724,7 @@ datapath_create(const char *type)
     dp->type = xstrdup(type);
     hmap_init(&dp->ct_zones);
     hmap_insert(&all_datapaths, &dp->node, hash_string(type, 0));
+    smap_init(&dp->caps);
     return dp;
 }
 
@@ -716,6 +741,7 @@ datapath_destroy(struct datapath *dp)
         hmap_remove(&all_datapaths, &dp->node);
         hmap_destroy(&dp->ct_zones);
         free(dp->type);
+        smap_destroy(&dp->caps);
         free(dp);
     }
 }
@@ -759,6 +785,23 @@ ct_zones_reconfigure(struct datapath *dp, struct ovsrec_datapath *dp_cfg)
 }
 
 static void
+dp_capability_reconfigure(struct datapath *dp,
+                          struct ovsrec_datapath *dp_cfg)
+{
+    struct smap_node *node;
+    struct smap cap;
+
+    smap_init(&cap);
+    ofproto_get_datapath_cap(dp->type, &cap);
+
+    SMAP_FOR_EACH (node, &cap) {
+        ovsrec_datapath_update_capabilities_setkey(dp_cfg, node->key,
+                                                   node->value);
+    }
+    smap_destroy(&cap);
+}
+
+static void
 datapath_reconfigure(const struct ovsrec_open_vswitch *cfg)
 {
     struct datapath *dp, *next;
@@ -771,6 +814,7 @@ datapath_reconfigure(const struct ovsrec_open_vswitch *cfg)
         dp = datapath_lookup(dp_name);
         if (!dp) {
             dp = datapath_create(dp_name);
+            dp_capability_reconfigure(dp, dp_cfg);
         }
         dp->last_used = idl_seqno;
         ct_zones_reconfigure(dp, dp_cfg);
@@ -3195,6 +3239,19 @@ bridge_run__(void)
     }
 }
 
+static int
+bridge_remove_all_bridges(void)
+{
+    /* this will delete all pmd threads, release all
+     * netdevs and free datapath.
+     */
+    struct bridge *br, *next_br;
+    HMAP_FOR_EACH_SAFE (br, next_br, node, &all_bridges) {
+        bridge_destroy(br, true);
+    }
+    return 0;
+}
+
 void
 bridge_run(void)
 {
@@ -3227,6 +3284,9 @@ bridge_run(void)
                || !ovsdb_idl_has_ever_connected(idl)) {
         /* Returns if not holding the lock or not done retrieving db
          * contents. */
+        system_stats_enable(false);
+        ndu_run();
+        bridge_run__();
         return;
     }
     cfg = ovsrec_open_vswitch_first(idl);
@@ -3234,6 +3294,7 @@ bridge_run(void)
     if (cfg) {
         netdev_set_flow_api_enabled(&cfg->other_config);
         dpdk_init(&cfg->other_config);
+        userspace_tso_init(&cfg->other_config);
     }
 
     /* Initialize the ofproto library.  This only needs to run once, but
@@ -3263,6 +3324,10 @@ bridge_run(void)
         stream_ssl_set_key_and_cert(ssl->private_key, ssl->certificate);
         stream_ssl_set_ca_cert_file(ssl->ca_cert, ssl->bootstrap_ca_cert);
     }
+
+    /* before bridge_reconfiguration, do netdev dpdk probe */
+    if (ndu_client_before_stage2() == EAGAIN)
+        return;
 
     if (ovsdb_idl_get_seqno(idl) != idl_seqno ||
         if_notifier_changed(ifnotifier)) {
@@ -3308,6 +3373,7 @@ bridge_run(void)
         }
     }
 
+    ndu_run();
     run_stats_update();
     run_status_update();
     run_system_stats();
@@ -3318,6 +3384,8 @@ bridge_wait(void)
 {
     struct sset types;
     const char *type;
+
+    ndu_wait();
 
     ovsdb_idl_wait(idl);
     if (daemonize_txn) {
@@ -3339,8 +3407,12 @@ bridge_wait(void)
         HMAP_FOR_EACH (br, node, &all_bridges) {
             ofproto_wait(br->ofproto);
         }
-        stats_update_wait();
-        status_update_wait();
+
+        if (ndu_state() == NDU_STATE_IDLE) {
+            stats_update_wait();
+            status_update_wait();
+            system_stats_enable(true);
+        }
     }
 
     system_stats_wait();
@@ -3793,6 +3865,31 @@ get_controller_ofconn_type(const char *target, const char *type)
             ? (!strcmp(type, "primary") ? OFCONN_PRIMARY : OFCONN_SERVICE)
             : (!vconn_verify_name(target) ? OFCONN_PRIMARY : OFCONN_SERVICE));
 }
+
+static int
+bridge_remove_services_and_snoop(void)
+{
+    const struct bridge *br;
+
+    HMAP_FOR_EACH (br, node, &all_bridges) {
+        struct shash ocs = SHASH_INITIALIZER(&ocs);
+        VLOG_INFO("Remove %s mgt unix socket\n", br->name);
+        shash_add_nocopy(
+                &ocs, xasprintf("punix:%s/%s.mgmt", ovs_rundir(), br->name), (void*)1);
+        ofproto_remove_controllers(br->ofproto, &ocs);
+        shash_destroy(&ocs);
+
+        if (ofproto_has_snoops(br->ofproto)) {
+            struct sset snoops;
+            sset_init(&snoops);
+            /* empty snoops */
+            ofproto_set_snoops(br->ofproto, &snoops);
+            sset_destroy(&snoops);
+        }
+    }
+    return 0;
+}
+
 
 static void
 bridge_configure_remotes(struct bridge *br,

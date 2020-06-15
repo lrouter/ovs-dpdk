@@ -217,6 +217,7 @@ struct upcall {
     ofp_port_t ofp_in_port;        /* OpenFlow in port, or OFPP_NONE. */
     uint16_t mru;                  /* If !0, Maximum receive unit of
                                       fragmented IP packet */
+    uint64_t hash;
 
     enum upcall_type type;         /* Type of the upcall. */
     const struct nlattr *actions;  /* Flow actions in DPIF_UC_ACTION Upcalls. */
@@ -331,11 +332,9 @@ static size_t recv_upcalls(struct handler *);
 static int process_upcall(struct udpif *, struct upcall *,
                           struct ofpbuf *odp_actions, struct flow_wildcards *);
 static void handle_upcalls(struct udpif *, struct upcall *, size_t n_upcalls);
-static void udpif_stop_threads(struct udpif *);
+static void udpif_stop_threads(struct udpif *, bool delete_flows);
 static void udpif_start_threads(struct udpif *, size_t n_handlers,
                                 size_t n_revalidators);
-static void udpif_pause_revalidators(struct udpif *);
-static void udpif_resume_revalidators(struct udpif *);
 static void *udpif_upcall_handler(void *);
 static void *udpif_revalidator(void *);
 static unsigned long udpif_get_n_flows(struct udpif *);
@@ -482,7 +481,7 @@ udpif_run(struct udpif *udpif)
 void
 udpif_destroy(struct udpif *udpif)
 {
-    udpif_stop_threads(udpif);
+    udpif_stop_threads(udpif, false);
 
     dpif_register_dp_purge_cb(udpif->dpif, NULL, udpif);
     dpif_register_upcall_cb(udpif->dpif, NULL, udpif);
@@ -503,9 +502,15 @@ udpif_destroy(struct udpif *udpif)
     free(udpif);
 }
 
-/* Stops the handler and revalidator threads. */
+/* Stops the handler and revalidator threads.
+ *
+ * If 'delete_flows' is true, we delete ukeys and delete all flows from the
+ * datapath.  Otherwise, we end up double-counting stats for flows that remain
+ * in the datapath.  If 'delete_flows' is false, we skip this step.  This is
+ * appropriate if OVS is about to exit anyway and it is desirable to let
+ * existing network connections continue being forwarded afterward. */
 static void
-udpif_stop_threads(struct udpif *udpif)
+udpif_stop_threads(struct udpif *udpif, bool delete_flows)
 {
     if (udpif && (udpif->n_handlers != 0 || udpif->n_revalidators != 0)) {
         size_t i;
@@ -525,10 +530,10 @@ udpif_stop_threads(struct udpif *udpif)
         dpif_disable_upcall(udpif->dpif);
         ovsrcu_quiesce_end();
 
-        /* Delete ukeys, and delete all flows from the datapath to prevent
-         * double-counting stats. */
-        for (i = 0; i < udpif->n_revalidators; i++) {
-            revalidator_purge(&udpif->revalidators[i]);
+        if (delete_flows) {
+            for (i = 0; i < udpif->n_revalidators; i++) {
+                revalidator_purge(&udpif->revalidators[i]);
+            }
         }
 
         latch_poll(&udpif->exit_latch);
@@ -593,7 +598,7 @@ udpif_start_threads(struct udpif *udpif, size_t n_handlers_,
 /* Pauses all revalidators.  Should only be called by the main thread.
  * When function returns, all revalidators are paused and will proceed
  * only after udpif_resume_revalidators() is called. */
-static void
+void
 udpif_pause_revalidators(struct udpif *udpif)
 {
     if (udpif->backer->recv_set_enable) {
@@ -604,7 +609,7 @@ udpif_pause_revalidators(struct udpif *udpif)
 
 /* Resumes the pausing of revalidators.  Should only be called by the
  * main thread. */
-static void
+void
 udpif_resume_revalidators(struct udpif *udpif)
 {
     if (udpif->backer->recv_set_enable) {
@@ -626,7 +631,7 @@ udpif_set_threads(struct udpif *udpif, size_t n_handlers_,
 
     if (udpif->n_handlers != n_handlers_
         || udpif->n_revalidators != n_revalidators_) {
-        udpif_stop_threads(udpif);
+        udpif_stop_threads(udpif, true);
     }
 
     if (!udpif->handlers && !udpif->revalidators) {
@@ -641,23 +646,6 @@ udpif_set_threads(struct udpif *udpif, size_t n_handlers_,
 
         udpif_start_threads(udpif, n_handlers_, n_revalidators_);
     }
-}
-
-/* Waits for all ongoing upcall translations to complete.  This ensures that
- * there are no transient references to any removed ofprotos (or other
- * objects).  In particular, this should be called after an ofproto is removed
- * (e.g. via xlate_remove_ofproto()) but before it is destroyed. */
-void
-udpif_synchronize(struct udpif *udpif)
-{
-    /* This is stronger than necessary.  It would be sufficient to ensure
-     * (somehow) that each handler and revalidator thread had passed through
-     * its main loop once. */
-    size_t n_handlers_ = udpif->n_handlers;
-    size_t n_revalidators_ = udpif->n_revalidators;
-
-    udpif_stop_threads(udpif);
-    udpif_start_threads(udpif, n_handlers_, n_revalidators_);
 }
 
 /* Notifies 'udpif' that something changed which may render previous
@@ -697,7 +685,7 @@ udpif_flush(struct udpif *udpif)
     size_t n_handlers_ = udpif->n_handlers;
     size_t n_revalidators_ = udpif->n_revalidators;
 
-    udpif_stop_threads(udpif);
+    udpif_stop_threads(udpif, true);
     dpif_flow_flush(udpif->dpif);
     udpif_start_threads(udpif, n_handlers_, n_revalidators_);
 }
@@ -784,7 +772,8 @@ recv_upcalls(struct handler *handler)
         struct dpif_upcall *dupcall = &dupcalls[n_upcalls];
         struct upcall *upcall = &upcalls[n_upcalls];
         struct flow *flow = &flows[n_upcalls];
-        unsigned int mru;
+        unsigned int mru = 0;
+        uint64_t hash = 0;
         int error;
 
         ofpbuf_use_stub(recv_buf, recv_stubs[n_upcalls],
@@ -802,8 +791,10 @@ recv_upcalls(struct handler *handler)
 
         if (dupcall->mru) {
             mru = nl_attr_get_u16(dupcall->mru);
-        } else {
-            mru = 0;
+        }
+
+        if (dupcall->hash) {
+            hash = nl_attr_get_u64(dupcall->hash);
         }
 
         error = upcall_receive(upcall, udpif->backer, &dupcall->packet,
@@ -827,6 +818,7 @@ recv_upcalls(struct handler *handler)
         upcall->key = dupcall->key;
         upcall->key_len = dupcall->key_len;
         upcall->ufid = &dupcall->ufid;
+        upcall->hash = hash;
 
         upcall->out_tun_key = dupcall->out_tun_key;
         upcall->actions = dupcall->actions;
@@ -1540,7 +1532,8 @@ process_upcall(struct udpif *udpif, struct upcall *upcall,
                 flow_clear_conntrack(&frozen_flow);
             }
 
-            frozen_metadata_to_flow(&state->metadata, &frozen_flow);
+            frozen_metadata_to_flow(&upcall->ofproto->up, &state->metadata,
+                                    &frozen_flow);
             flow_get_metadata(&frozen_flow, &am->pin.up.base.flow_metadata);
 
             ofproto_dpif_send_async_msg(upcall->ofproto, am);
@@ -1600,6 +1593,7 @@ handle_upcalls(struct udpif *udpif, struct upcall *upcalls,
             op->dop.execute.needs_help = (upcall->xout.slow & SLOW_ACTION) != 0;
             op->dop.execute.probe = false;
             op->dop.execute.mtu = upcall->mru;
+            op->dop.execute.hash = upcall->hash;
         }
     }
 

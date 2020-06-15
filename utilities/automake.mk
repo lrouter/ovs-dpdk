@@ -3,7 +3,8 @@ bin_PROGRAMS += \
 	utilities/ovs-testcontroller \
 	utilities/ovs-dpctl \
 	utilities/ovs-ofctl \
-	utilities/ovs-vsctl
+	utilities/ovs-vsctl \
+	utilities/ovs-nductl
 bin_SCRIPTS += utilities/ovs-docker \
 	utilities/ovs-pki \
 	utilities/ovs-pcap \
@@ -18,7 +19,8 @@ scripts_SCRIPTS += \
 	utilities/ovs-check-dead-ifs \
 	utilities/ovs-ctl \
 	utilities/ovs-kmod-ctl \
-	utilities/ovs-save
+	utilities/ovs-save \
+	utilities/ovs-hotupgrade.sh
 scripts_DATA += utilities/ovs-lib
 
 completion_SCRIPTS += \
@@ -50,6 +52,7 @@ EXTRA_DIST += \
 	utilities/ovs-pipegen.py \
 	utilities/ovs-pki.in \
 	utilities/ovs-save \
+	utilities/ovs-hotupgrade.sh \
 	utilities/ovs-tcpdump.in \
 	utilities/ovs-tcpundump.in \
 	utilities/ovs-test.in \
@@ -136,6 +139,9 @@ utilities_ovs_ofctl_LDADD = \
 
 utilities_ovs_vsctl_SOURCES = utilities/ovs-vsctl.c
 utilities_ovs_vsctl_LDADD = lib/libopenvswitch.la
+
+utilities_ovs_nductl_SOURCES = utilities/ovs-nductl.c
+utilities_ovs_nductl_LDADD = lib/libopenvswitch.la
 
 if LINUX
 noinst_PROGRAMS += utilities/nlmon

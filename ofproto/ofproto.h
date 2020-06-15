@@ -372,6 +372,8 @@ void ofproto_ct_set_zone_timeout_policy(const char *datapath_type,
                                         struct simap *timeout_policy);
 void ofproto_ct_del_zone_timeout_policy(const char *datapath_type,
                                         uint16_t zone);
+void ofproto_get_datapath_cap(const char *datapath_type,
+                              struct smap *dp_cap);
 
 /* Configuration of ports. */
 void ofproto_port_unregister(struct ofproto *, ofp_port_t ofp_port);
@@ -559,6 +561,8 @@ int ofproto_port_get_cfm_status(const struct ofproto *,
 enum ofputil_table_miss ofproto_table_get_miss_config(const struct ofproto *,
                                                       uint8_t table_id);
 
+void
+ofproto_remove_controllers(struct ofproto *p, struct shash *controllers);
 #ifdef  __cplusplus
 }
 #endif

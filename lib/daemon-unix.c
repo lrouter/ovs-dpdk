@@ -437,7 +437,7 @@ monitor_daemon(pid_t daemon_pid)
  * daemon_complete()) or that it failed to start up (by exiting with a nonzero
  * exit code). */
 void
-daemonize_start(bool access_datapath)
+daemonize_start__(bool access_datapath)
 {
     assert_single_threaded();
     daemonize_fd = -1;
@@ -482,13 +482,24 @@ daemonize_start(bool access_datapath)
 
     forbid_forking("running in daemon process");
 
-    if (pidfile) {
-        make_pidfile();
-    }
-
     /* Make sure that the unixctl commands for vlog get registered in a
      * daemon, even before the first log message. */
     vlog_init();
+}
+
+void
+daemonize_start(bool access_datapath)
+{
+    daemonize_start__(access_datapath);
+    daemonize_make_pidfile();
+}
+
+void
+daemonize_make_pidfile(void)
+{
+    if (pidfile) {
+        make_pidfile();
+    }
 }
 
 /* If daemonization is configured, then this function notifies the parent
@@ -1048,4 +1059,60 @@ daemon_set_new_user(const char *user_spec)
     }
 
     switch_user = true;
+}
+
+pid_t
+get_already_running_pid(void)
+{
+    struct flock lck;
+    char line[128];
+    FILE *file;
+    int error;
+
+    file = fopen(pidfile, "r+");
+    if (!file) {
+        if (errno == ENOENT) {
+            /* no pid file, normal ovs launch */
+            return -1;
+        }
+        error = errno;
+        VLOG_WARN("%s: open: %s", pidfile, ovs_strerror(error));
+        return -1;
+    }
+
+    error = lock_pidfile__(file, F_GETLK, &lck);
+    if (error) {
+        VLOG_WARN("%s: fcntl: %s", pidfile, ovs_strerror(error));
+        fclose(file);
+        return -1;
+    }
+
+    if (lck.l_type == F_UNLCK) {
+        /* file exist, not lock anymore, normal ovs launch */
+        fclose(file);
+        return -1;
+    }
+
+    if (!fgets(line, sizeof line, file)) {
+        if (ferror(file)) {
+            error = errno;
+            VLOG_WARN("%s: read: %s", pidfile, ovs_strerror(error));
+        } else {
+            error = ESRCH;
+            VLOG_WARN("%s: read: unexpected end of file", pidfile);
+        }
+        fclose(file);
+        return -1;
+    }
+
+    if (lck.l_pid != strtoul(line, NULL, 10)) {
+        /* The process that has the pidfile locked is not the process that
+         * created it.  It must be stale, with the process that has it locked
+         * preparing to delete it. */
+        fclose(file);
+        return -1;
+    }
+
+    fclose(file);
+    return lck.l_pid;
 }

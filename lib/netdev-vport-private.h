@@ -40,6 +40,8 @@ struct netdev_vport {
 
     /* Patch Ports. */
     char *peer;
+    void *offload_aux;
+    void (*offload_aux_free)(void *);
 };
 
 int netdev_vport_construct(struct netdev *);
@@ -56,5 +58,10 @@ netdev_vport_cast(const struct netdev *netdev)
     ovs_assert(is_vport_class(netdev_get_class(netdev)));
     return CONTAINER_OF(netdev, struct netdev_vport, up);
 }
+
+enum {
+    VPORT_VXLAN,
+    VPORT_NONE,
+};
 
 #endif
